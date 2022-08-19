@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use notify::{Watcher, watcher, DebouncedEvent};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
@@ -7,20 +8,26 @@ use crate::{Message, parse_message};
 use std::process;
 
 pub fn receive() {
-    let path = get_socket_file().unwrap_or_else(|| {
-        eprintln!("Please provide an argument or the IPCBOX_FILE environment variable");
-        process::exit(1);
-    });
+    let path = get_socket_file()
+        .expect("Please provide an argument or the IPCBOX_FILE environment variable");
 
     let (tx, receiver) = channel();
     let mut watcher = watcher(tx, Duration::from_millis(250)).unwrap();
     watcher.watch(path, notify::RecursiveMode::NonRecursive).unwrap();
 
-    let mut child: Option<process::Child> = None;
+    let mut child = process::Command::new("sh")
+        .args(["-i"])   // Interative mode allows for interrupting the process
+                        // without killing the shell.
+        .env("PS1", "") // Removes the prompt
+        .stdin(process::Stdio::piped())
+        .spawn()
+        .expect("Could not spawn shell");
+
+    let mut stdin = child.stdin.take().expect("Could not open stdin");
 
     loop {
         let message = receive_message(&receiver);
-        execute_message(message, &mut child);
+        execute_message(message, &mut child, &mut stdin);
     }
 }
 
@@ -34,31 +41,21 @@ fn receive_message(receiver: &Receiver<DebouncedEvent>) -> Option<Message> {
     }
 }
 
-fn execute_message(message: Option<Message>, child: &mut Option<process::Child>) {
+fn execute_message(message: Option<Message>, child: &mut process::Child, stdin: &mut process::ChildStdin) {
     match message {
         None => {},
         Some(Message::Interrupt) => {
-            match child {
-                Some(c) => {_ = c.kill();},
-                _ => {}
-            };
+            process::Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .spawn()
+                .expect("Could not spawn interrupt signal");
         }
         Some(Message::Exit) => {
-            match child {
-                Some(c) => {_ = c.kill();},
-                _ => {}
-            };
+            child.kill().expect("Could not kill child");
             std::process::exit(0);
         },
         Some(Message::Command(command)) => {
-            match child {
-                Some(c) => {_ = c.kill();},
-                _ => {}
-            };
-            match process::Command::new("sh").args(["-c", command.as_str()]).spawn() {
-                Ok(c) => {*child = Some(c);},
-                _ => {}
-            }
+            stdin.write_all(command.as_bytes()).expect("Could not write message");
         }
     }
 }
